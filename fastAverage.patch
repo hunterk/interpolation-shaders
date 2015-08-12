@@ -1,0 +1,274 @@
+diff --git a/higan_v093-source/nall/dsp/core.hpp b/higan_v093-source-patched/nall/dsp/core.hpp
+index ee730ab..372f517 100755
+--- a/higan_v093-source/nall/dsp/core.hpp
++++ b/higan_v093-source-patched/nall/dsp/core.hpp
+@@ -30,6 +30,8 @@ struct DSP {
+     Hermite,
+     Average,
+     Sinc,
++    FastSinc,
++    FastAverage
+   };
+ 
+   inline void setChannels(unsigned channels);
+@@ -57,6 +59,8 @@ protected:
+   friend class ResampleAverage;
+   friend class ResampleHermite;
+   friend class ResampleSinc;
++  friend class ResampleFastSinc;
++  friend class ResampleFastAverage;
+ 
+   struct Settings {
+     unsigned channels;
+@@ -89,6 +93,8 @@ protected:
+ #include "resample/hermite.hpp"
+ #include "resample/average.hpp"
+ #include "resample/sinc.hpp"
++#include "resample/fastSinc.hpp"
++#include "resample/fastAverage.hpp"
+ #include "settings.hpp"
+ 
+ void DSP::sample(signed channel[]) {
+diff --git a/higan_v093-source-patched/nall/dsp/resample/fastAverage.hpp b/higan_v093-source-patched/nall/dsp/resample/fastAverage.hpp
+new file mode 100755
+index 0000000..919119c
+--- /dev/null
++++ b/higan_v093-source-patched/nall/dsp/resample/fastAverage.hpp
+@@ -0,0 +1,92 @@
++#ifdef NALL_DSP_INTERNAL_HPP
++
++struct ResampleFastAverage : Resampler {
++  inline void setFrequency();
++  inline void clear();
++  inline void sample();
++
++  ResampleFastAverage(DSP& dsp) : Resampler(dsp) {}
++
++private:
++  inline void sampleLinear();
++  real lastVals[8];
++  real fraction;
++  real step;
++  int counter;
++  int skip;
++};
++
++void ResampleFastAverage::setFrequency() {
++  assert(dsp.settings.channels <= 8 );
++  skip=1;
++  if((dsp.settings.frequency/(32.0))>frequency){
++    skip=32;
++  }
++  counter=0;
++  //printf("dsp.settings.frequency=%f\n",(float)dsp.settings.frequency);
++  //printf("skip=%i\n",skip);
++  fraction = 0.0;
++  step = (dsp.settings.frequency/(real)skip) / frequency;
++  for(unsigned c = 0; c < dsp.settings.channels; c++) {
++    lastVals[c]=0.0;
++  }
++}
++
++void ResampleFastAverage::clear() {
++  fraction = 0.0;
++  counter=0;
++  for(unsigned c = 0; c < dsp.settings.channels; c++) {
++    lastVals[c]=0.0;
++  }
++}
++
++void ResampleFastAverage::sample() {
++  if(step < 1.0) return sampleLinear();
++
++  counter++;
++  if(counter<skip){
++    dsp.buffer.rdoffset++;
++    return;
++  }
++  counter=0;
++
++  fraction+=1.0;
++
++  if (fraction>step){
++    fraction-=step;
++    for(unsigned c = 0; c < dsp.settings.channels; c++) {
++      lastVals[c]+= dsp.buffer.read(c)*(1.0-fraction);
++      dsp.output.write(c) = lastVals[c]/step;
++      lastVals[c]=dsp.buffer.read(c)*(fraction);
++    }
++    dsp.output.wroffset++;
++    }else{
++      for(unsigned c = 0; c < dsp.settings.channels; c++) {
++      lastVals[c]+=dsp.buffer.read(c);
++      }
++    }
++
++  dsp.buffer.rdoffset++;
++
++}
++void ResampleFastAverage::sampleLinear() {
++  while(fraction <= 1.0) {
++    real channel[dsp.settings.channels];
++
++    for(unsigned n = 0; n < dsp.settings.channels; n++) {
++      real a = dsp.buffer.read(n, -1);
++      real b = dsp.buffer.read(n, -0);
++
++      real mu = fraction;
++
++      channel[n] = a * (1.0 - mu) + b * mu;
++    }
++
++    dsp.write(channel);
++    fraction += step;
++  }
++
++  dsp.buffer.rdoffset++;
++  fraction -= 1.0;
++}
++#endif
+diff --git a/higan_v093-source-patched/nall/dsp/resample/fastSinc.hpp b/higan_v093-source-patched/nall/dsp/resample/fastSinc.hpp
+new file mode 100755
+index 0000000..5767a80
+--- /dev/null
++++ b/higan_v093-source-patched/nall/dsp/resample/fastSinc.hpp
+@@ -0,0 +1,69 @@
++#ifdef NALL_DSP_INTERNAL_HPP
++
++#include "lib/sinc.hpp"
++
++struct ResampleFastSinc : Resampler {
++  inline void setFrequency();
++  inline void clear();
++  inline void sample();
++  inline ResampleFastSinc(DSP& dsp);
++
++private:
++  inline void remakeSinc();
++  SincResample* sinc_resampler[8];
++  int counter;
++  int skip;
++};
++
++void ResampleFastSinc::setFrequency() {
++  remakeSinc();
++}
++
++void ResampleFastSinc::clear() {
++  remakeSinc();
++}
++
++void ResampleFastSinc::sample() {
++  counter++;
++  if(counter<skip){
++    dsp.buffer.rdoffset++;
++    return;
++  }
++  counter=0;
++
++  for(unsigned c = 0; c < dsp.settings.channels; c++) {
++    sinc_resampler[c]->write(dsp.buffer.read(c));
++  }
++
++  if(sinc_resampler[0]->output_avail()) {
++    do {
++      for(unsigned c = 0; c < dsp.settings.channels; c++) {
++        dsp.output.write(c) = sinc_resampler[c]->read();
++      }
++      dsp.output.wroffset++;
++    } while(sinc_resampler[0]->output_avail());
++  }
++
++  dsp.buffer.rdoffset++;
++}
++
++ResampleFastSinc::ResampleFastSinc(DSP& dsp) : Resampler(dsp) {
++  for(unsigned n = 0; n < 8; n++) sinc_resampler[n] = nullptr;
++}
++
++void ResampleFastSinc::remakeSinc() {
++  assert(dsp.settings.channels < 8);
++  skip=1;
++  if((dsp.settings.frequency/(32.0))>frequency){
++    skip=32;
++  }
++  counter=0;
++  //printf("dsp freq=%f\n",(float)dsp.settings.frequency);
++  //printf("skip=%i\n",skip);
++  for(unsigned c = 0; c < dsp.settings.channels; c++) {
++    if(sinc_resampler[c]) delete sinc_resampler[c];
++    sinc_resampler[c] = new SincResample(dsp.settings.frequency/(real)skip, frequency, 0.85, SincResample::QUALITY_HIGH);
++  }
++}
++
++#endif
+diff --git a/higan_v093-source/nall/dsp/resample/lib/sinc.hpp b/higan_v093-source-patched/nall/dsp/resample/lib/sinc.hpp
+index 67c793d..e008148 100755
+--- a/higan_v093-source/nall/dsp/resample/lib/sinc.hpp
++++ b/higan_v093-source-patched/nall/dsp/resample/lib/sinc.hpp
+@@ -1,3 +1,6 @@
++#ifndef LIB_SINC_HPP
++#define LIB_SINC_HPP
++
+ // If these types are changed to anything other than "float", you should comment out the SSE detection directives below
+ // so that the SSE code is not used.
+ 
+@@ -598,3 +601,5 @@ void* ResampleUtility::make_aligned(void* ptr, unsigned boundary)
+ 
+  return uc_ptr;
+ }
++
++#endif //#ifndef LIB_SINC_HPP
+diff --git a/higan_v093-source/nall/dsp/settings.hpp b/higan_v093-source-patched/nall/dsp/settings.hpp
+index 3a8f24c..c714d24 100755
+--- a/higan_v093-source/nall/dsp/settings.hpp
++++ b/higan_v093-source-patched/nall/dsp/settings.hpp
+@@ -30,13 +30,15 @@ void DSP::setResampler(ResampleEngine engine) {
+   if(resampler) delete resampler;
+ 
+   switch(engine) {
+-  case ResampleEngine::Nearest: resampler = new ResampleNearest(*this); return;
+-  case ResampleEngine::Linear:  resampler = new ResampleLinear (*this); return;
+-  case ResampleEngine::Cosine:  resampler = new ResampleCosine (*this); return;
+-  case ResampleEngine::Cubic:   resampler = new ResampleCubic  (*this); return;
+-  case ResampleEngine::Hermite: resampler = new ResampleHermite(*this); return;
+-  case ResampleEngine::Average: resampler = new ResampleAverage(*this); return;
+-  case ResampleEngine::Sinc:    resampler = new ResampleSinc   (*this); return;
++  case ResampleEngine::Nearest:     resampler = new ResampleNearest     (*this); return;
++  case ResampleEngine::Linear:      resampler = new ResampleLinear      (*this); return;
++  case ResampleEngine::Cosine:      resampler = new ResampleCosine      (*this); return;
++  case ResampleEngine::Cubic:       resampler = new ResampleCubic       (*this); return;
++  case ResampleEngine::Hermite:     resampler = new ResampleHermite     (*this); return;
++  case ResampleEngine::Average:     resampler = new ResampleAverage     (*this); return;
++  case ResampleEngine::Sinc:        resampler = new ResampleSinc        (*this); return;
++  case ResampleEngine::FastSinc:    resampler = new ResampleFastSinc    (*this); return;
++  case ResampleEngine::FastAverage: resampler = new ResampleFastAverage (*this); return;
+   }
+ 
+   throw;
+diff --git a/higan_v093-source/target-ethos/settings/audio.cpp b/higan_v093-source-patched/target-ethos/settings/audio.cpp
+index 3465d5f..7bd3ff2 100755
+--- a/higan_v093-source/target-ethos/settings/audio.cpp
++++ b/higan_v093-source-patched/target-ethos/settings/audio.cpp
+@@ -14,7 +14,7 @@ AudioSettings::AudioSettings() {
+   latencyLabel.setText("Latency:");
+   latency.append("20ms", "40ms", "60ms", "80ms", "100ms");
+   resamplerLabel.setText("Resampler:");
+-  resampler.append("Linear", "Hermite", "Sinc");
++  resampler.append("Linear", "Hermite", "Sinc", "FastSinc", "FastAverage");
+   volume.name.setText("Volume:");
+   volume.slider.setLength(201);
+ 
+diff --git a/higan_v093-source/target-ethos/utility/utility.cpp b/higan_v093-source-patched/target-ethos/utility/utility.cpp
+index e2fe173..9a40ceb 100755
+--- a/higan_v093-source/target-ethos/utility/utility.cpp
++++ b/higan_v093-source-patched/target-ethos/utility/utility.cpp
+@@ -188,6 +188,8 @@ void Utility::synchronizeRuby() {
+   case 0: dspaudio.setResampler(DSP::ResampleEngine::Linear);  break;
+   case 1: dspaudio.setResampler(DSP::ResampleEngine::Hermite); break;
+   case 2: dspaudio.setResampler(DSP::ResampleEngine::Sinc);    break;
++  case 3: dspaudio.setResampler(DSP::ResampleEngine::FastSinc);   break;
++  case 4: dspaudio.setResampler(DSP::ResampleEngine::FastAverage); break;
+   }
+   dspaudio.setResamplerFrequency(config->audio.frequency);
+   dspaudio.setVolume(config->audio.mute ? 0.0 : config->audio.volume * 0.01);
